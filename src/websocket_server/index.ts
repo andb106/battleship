@@ -34,6 +34,7 @@ interface GamePlayer {
   ws: WebSocket;
   ships: Ship[];
   alreadyAttackedCells?: Set<string>;
+  countShots: number;
 }
 
 interface Game {
@@ -41,6 +42,13 @@ interface Game {
   gamePlayers: GamePlayer[];
   currentTurn?: number;
 }
+
+interface Winner {
+  name: string | undefined;
+  wins: number;
+}
+
+const WinnersStorage: Winner[] = [];
 
 const GamesStorage: Game[] = [];
 
@@ -57,15 +65,31 @@ console.log(`Start websocket server on the ${WSS_PORT} port!`);
 wss.on('connection', function connection(ws) {
   ws.on('error', console.error);
 
+  ws.on('close', () => {
+    const userCloseWsId = users.get(ws)?.id;
+    const gameToClose = GamesStorage.find((game) =>
+      game.gamePlayers.find((player) => player.id === userCloseWsId),
+    );
+    gameToClose?.gamePlayers.forEach((player) => {
+      if (player.ws.readyState === WebSocket.OPEN) {
+        updateWinners(player, gameToClose);
+      }
+    });
+  });
+
   ws.on('message', function message(data) {
     const parsedMessage = JSON.parse(data.toString());
     const typeMessage = parsedMessage.type;
 
-    console.log('data from frontend -->', parsedMessage);
-
     const updatedRooms = {
       type: 'update_room',
       data: roomsStorage,
+      id: 0,
+    };
+
+    const winnersTableDataToSend = {
+      type: 'update_winners',
+      data: WinnersStorage,
       id: 0,
     };
 
@@ -74,22 +98,36 @@ wss.on('connection', function connection(ws) {
         const name = JSON.parse(parsedMessage.data).name;
         const password = JSON.parse(parsedMessage.data).password;
 
+        const isValidName = Array.from(users.values()).every(
+          (userData) => userData.name !== name,
+        );
+
         const playerData = { id: ++INITIAL_PLAYER_INDEX, password, name };
 
         users.set(ws, playerData);
 
-        const regDataTest: ServerRegMessage = {
+        const regData: ServerRegMessage = {
           type: 'reg',
           data: {
             name: playerData.name,
             index: playerData.id,
-            error: false,
-            errorText: '',
+            error: isValidName ? false : true,
+            errorText: isValidName
+              ? ''
+              : 'name is already taken, enter another name',
           },
           id: 0,
         };
 
-        ws.send(messageToJsonString(regDataTest));
+        ws.send(messageToJsonString(regData));
+
+        wss.clients.forEach(function each(client) {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(messageToJsonString(updatedRooms));
+            client.send(messageToJsonString(winnersTableDataToSend));
+          }
+        });
+
         break;
 
       case 'create_room':
@@ -103,7 +141,15 @@ wss.on('connection', function connection(ws) {
           ],
         };
 
-        roomsStorage.push(newRoom);
+        const currentUserName = users.get(ws)?.name;
+
+        const isRoomExist = roomsStorage.find(({ roomUsers }) =>
+          roomUsers.find(({ name }) => name === currentUserName),
+        );
+
+        if (!isRoomExist) {
+          roomsStorage.push(newRoom);
+        }
 
         // update rooms
 
@@ -154,8 +200,15 @@ wss.on('connection', function connection(ws) {
             }
           });
 
-          // update rooms
+          const roomIndexForCurrentUser = roomsStorage.findIndex((room) =>
+            room.roomUsers.find((user) => user.index === currentUserId),
+          );
+
+          // delete rooms from storage
           roomsStorage.splice(roomIndexForGame, 1);
+          roomsStorage.splice(roomIndexForCurrentUser, 1);
+
+          // update rooms
           wss.clients.forEach(function each(client) {
             if (client.readyState === WebSocket.OPEN) {
               client.send(messageToJsonString(updatedRooms));
@@ -179,6 +232,7 @@ wss.on('connection', function connection(ws) {
           ships: clientMessage.data.ships,
           ws,
           alreadyAttackedCells: new Set(),
+          countShots: 0,
         };
 
         const gameIndex = GamesStorage.findIndex(
@@ -286,6 +340,13 @@ wss.on('connection', function connection(ws) {
           currentGame.currentTurn = enemyPlayer?.id;
         }
 
+        if (
+          attackingPlayer &&
+          (statusAttack.status === 'shot' || statusAttack.status === 'killed')
+        ) {
+          attackingPlayer.countShots += 1;
+        }
+
         const turnDataToSend = {
           type: 'turn',
           data: {
@@ -350,6 +411,11 @@ wss.on('connection', function connection(ws) {
           }
         });
 
+        // send winner update winners table
+        if (attackingPlayer && attackingPlayer.countShots === 20) {
+          updateWinners(attackingPlayer, currentGame);
+        }
+
         break;
 
       default:
@@ -357,6 +423,53 @@ wss.on('connection', function connection(ws) {
     }
   });
 });
+
+function updateWinners(
+  attackingPlayer: GamePlayer,
+  currentGame: Game | undefined,
+) {
+  const winnerDataToSend = {
+    type: 'finish',
+    data: {
+      winPlayer: attackingPlayer.id,
+    },
+    id: 0,
+  };
+
+  const winnerIndex = WinnersStorage.findIndex((winner) => {
+    return winner.name === users.get(attackingPlayer.ws)?.name;
+  });
+
+  // update winners table
+  if (winnerIndex === -1) {
+    const newWinner = {
+      name: users.get(attackingPlayer.ws)?.name,
+      wins: 1,
+    };
+    WinnersStorage.push(newWinner);
+  } else {
+    const winner = WinnersStorage[winnerIndex];
+    if (winner) {
+      winner.wins += 1;
+    }
+  }
+
+  const winnersTableDataToSend = {
+    type: 'update_winners',
+    data: WinnersStorage,
+    id: 0,
+  };
+
+  // send winner
+  currentGame?.gamePlayers.forEach((player) => {
+    player.ws.send(messageToJsonString(winnerDataToSend));
+  });
+
+  // send winner table
+  wss.clients.forEach((client) => {
+    client.send(messageToJsonString(winnersTableDataToSend));
+  });
+}
 
 function messageToJsonString(message: BaseMessage<unknown>) {
   const fieldDataToJsonString = JSON.stringify(message.data);
